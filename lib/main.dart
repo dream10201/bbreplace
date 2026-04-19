@@ -45,6 +45,7 @@ class _HomePageState extends State<HomePage> {
   bool _ignoringBatteryOptimizations = false;
   bool _notificationsEnabled = false;
   InputMode _inputMode = InputMode.auto;
+  VadMode _vadMode = VadMode.aggressive;
 
   @override
   void initState() {
@@ -56,6 +57,7 @@ class _HomePageState extends State<HomePage> {
     unawaited(_refreshBatteryOptimizationStatus());
     unawaited(_refreshNotificationPermissionStatus());
     unawaited(_refreshInputMode());
+    unawaited(_refreshVadMode());
   }
 
   @override
@@ -145,6 +147,25 @@ class _HomePageState extends State<HomePage> {
       }
       setState(() {
         _inputMode = InputMode.auto;
+      });
+    }
+  }
+
+  Future<void> _refreshVadMode() async {
+    try {
+      final result = await _methodChannel.invokeMethod<int>('getVadMode') ?? 2;
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _vadMode = VadMode.fromValue(result);
+      });
+    } on MissingPluginException {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _vadMode = VadMode.aggressive;
       });
     }
   }
@@ -262,6 +283,24 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> _setVadMode(VadMode mode) async {
+    if (_vadMode == mode) {
+      return;
+    }
+    try {
+      await _methodChannel.invokeMethod('setVadMode', {'mode': mode.value});
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _vadMode = mode;
+      });
+      _showSnackBar('VAD 灵敏度已切换为${mode.label}');
+    } on PlatformException catch (error) {
+      _showSnackBar(error.message ?? '切换 VAD 灵敏度失败');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -359,6 +398,9 @@ class _HomePageState extends State<HomePage> {
                       const SizedBox(height: 16),
                       _RouteLine(label: '当前输入', value: _status.inputRoute),
                       _RouteLine(label: '当前输出', value: _status.outputRoute),
+                      _RouteLine(label: '判定方式', value: _status.detectionMode),
+                      _RouteLine(label: '当前触发', value: _status.detectionSource),
+                      _RouteLine(label: '当前降噪', value: _status.noiseReductionMode),
                       const SizedBox(height: 16),
                       const _FeatureLine('带预录缓存，避免吞掉开头音节'),
                       const _FeatureLine('用动态噪声底和连续帧判定开始讲话'),
@@ -385,6 +427,29 @@ class _HomePageState extends State<HomePage> {
                         onSelectionChanged: (selection) {
                           final mode = selection.first;
                           unawaited(_setInputMode(mode));
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        'VAD 灵敏度',
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      SegmentedButton<VadMode>(
+                        segments: VadMode.values
+                            .map(
+                              (mode) => ButtonSegment<VadMode>(
+                                value: mode,
+                                label: Text(mode.label),
+                              ),
+                            )
+                            .toList(),
+                        selected: {_vadMode},
+                        onSelectionChanged: (selection) {
+                          final mode = selection.first;
+                          unawaited(_setVadMode(mode));
                         },
                       ),
                       const SizedBox(height: 12),
@@ -556,6 +621,9 @@ class StatusViewData {
     required this.lastUtteranceMs,
     required this.inputRoute,
     required this.outputRoute,
+    required this.detectionMode,
+    required this.detectionSource,
+    required this.noiseReductionMode,
   });
 
   const StatusViewData.idle()
@@ -564,7 +632,10 @@ class StatusViewData {
         isRunning = false,
         lastUtteranceMs = 0,
         inputRoute = '未知',
-        outputRoute = '未知';
+        outputRoute = '未知',
+        detectionMode = 'WebRTC VAD + RMS兜底',
+        detectionSource = '等待触发',
+        noiseReductionMode = 'RNNoise未启用';
 
   final String state;
   final String message;
@@ -572,6 +643,9 @@ class StatusViewData {
   final int lastUtteranceMs;
   final String inputRoute;
   final String outputRoute;
+  final String detectionMode;
+  final String detectionSource;
+  final String noiseReductionMode;
 
   factory StatusViewData.fromMap(Map<dynamic, dynamic> map) {
     return StatusViewData(
@@ -581,6 +655,9 @@ class StatusViewData {
       lastUtteranceMs: (map['lastUtteranceMs'] as num?)?.toInt() ?? 0,
       inputRoute: map['inputRoute'] as String? ?? '未知',
       outputRoute: map['outputRoute'] as String? ?? '未知',
+      detectionMode: map['detectionMode'] as String? ?? 'WebRTC VAD + RMS兜底',
+      detectionSource: map['detectionSource'] as String? ?? '等待触发',
+      noiseReductionMode: map['noiseReductionMode'] as String? ?? 'RNNoise未启用',
     );
   }
 
@@ -615,6 +692,25 @@ enum InputMode {
     return InputMode.values.firstWhere(
       (mode) => mode.value == value,
       orElse: () => InputMode.auto,
+    );
+  }
+}
+
+enum VadMode {
+  quality(0, '最灵敏'),
+  lowBitrate(1, '灵敏'),
+  aggressive(2, '平衡'),
+  veryAggressive(3, '保守');
+
+  const VadMode(this.value, this.label);
+
+  final int value;
+  final String label;
+
+  factory VadMode.fromValue(int value) {
+    return VadMode.values.firstWhere(
+      (mode) => mode.value == value,
+      orElse: () => VadMode.aggressive,
     );
   }
 }

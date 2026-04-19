@@ -61,10 +61,17 @@ class MainActivity : FlutterActivity() {
                     }
 
                     "getInputMode" -> result.success(runStateStore.getInputMode())
+                    "getVadMode" -> result.success(runStateStore.getVadMode())
 
                     "setInputMode" -> {
                         val mode = call.argument<String>("mode") ?: RunStateStore.INPUT_MODE_AUTO
                         runStateStore.setInputMode(mode)
+                        result.success(true)
+                    }
+
+                    "setVadMode" -> {
+                        val mode = call.argument<Int>("mode") ?: RunStateStore.DEFAULT_VAD_MODE
+                        runStateStore.setVadMode(mode.coerceIn(0, 3))
                         result.success(true)
                     }
 

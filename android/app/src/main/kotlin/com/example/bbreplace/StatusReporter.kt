@@ -15,6 +15,9 @@ object StatusReporter {
         "lastUtteranceMs" to 0,
         "inputRoute" to "未知",
         "outputRoute" to "未知",
+        "detectionMode" to "WebRTC VAD + RMS兜底",
+        "detectionSource" to "等待触发",
+        "noiseReductionMode" to "RNNoise未启用",
     )
 
     @Volatile

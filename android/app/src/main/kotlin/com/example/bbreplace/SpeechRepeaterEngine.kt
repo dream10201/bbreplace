@@ -24,13 +24,13 @@ class SpeechRepeaterEngine(
     private val sampleRate = 16_000
     private val frameSamples = 320
     private val frameBytes = frameSamples * 2
-    private val startFramesRequired = 2
+    private val startFramesRequired = 1
     private val endSilenceFrames = 52
     private val minSpeechFrames = 8
     private val maxSpeechFrames = 3000
-    private val preRollFrames = 22
+    private val preRollFrames = 28
     private val endPaddingFrames = 8
-    private val maxLeadingSilenceFrames = 3
+    private val maxLeadingSilenceFrames = 8
     private val maxTrailingSilenceFrames = 4
     private val maxInternalSilenceFrames = 12
     private val startThresholdFloor = 520.0
@@ -41,6 +41,8 @@ class SpeechRepeaterEngine(
     private val routeCheckIntervalFrames = 100
     private val postPlaybackSuppressMs = 180L
     private val playbackKeepAliveIntervalMs = 120L
+    private val vadSpeechExitFrames = 10
+    private val realtimeStatusIntervalMs = 350L
     private val routeController = AudioRouteController(appContext)
     private val runStateStore = RunStateStore(appContext)
 
@@ -113,6 +115,9 @@ class SpeechRepeaterEngine(
         val preRoll = ArrayDeque<ByteArray>()
         val captureFrames = ArrayList<ByteArray>()
         val playbackTrack = createPlaybackTrack()
+        val vad = WebRtcVadNative(runStateStore.getVadMode())
+        val rnNoise = RnNoiseNative()
+        val noiseReductionMode = if (rnNoise.isReady) "RNNoise已启用" else "原始音频"
         var noiseFloor = 280.0
         var voicedFrames = 0
         var silentFrames = 0
@@ -123,6 +128,8 @@ class SpeechRepeaterEngine(
         var frameCounter = 0
         var lastRouteEnsureMs = 0L
         var lastKeepAliveWriteMs = 0L
+        var lastDetectionSource = "等待触发"
+        var lastRealtimeStatusMs = 0L
 
         try {
             recorder.startRecording()
@@ -136,6 +143,8 @@ class SpeechRepeaterEngine(
                     lastUtteranceMs,
                     inputRoute = currentInputRoute,
                     outputRoute = routeName,
+                    detectionSource = lastDetectionSource,
+                    noiseReductionMode = noiseReductionMode,
                 ),
             )
 
@@ -166,7 +175,9 @@ class SpeechRepeaterEngine(
 
                 val nowMs = System.currentTimeMillis()
                 val frame = frameBuffer.copyOf()
+                rnNoise.processInPlace(frame)
                 val rms = calculateRms(frame)
+                val vadSpeech = vad.isSpeech(sampleRate, frame, frameSamples)
 
                 if (preferBluetooth) {
                     lastKeepAliveWriteMs =
@@ -181,17 +192,59 @@ class SpeechRepeaterEngine(
                     noiseFloor = recoverNoiseFloor(noiseFloor)
                     preRoll.addLast(frame)
                     trimPreRoll(preRoll)
+                    lastRealtimeStatusMs =
+                        publishRealtimeStatusIfNeeded(
+                            nowMs = nowMs,
+                            lastRealtimeStatusMs = lastRealtimeStatusMs,
+                            currentDetectionSource = lastDetectionSource,
+                            nextDetectionSource = "回放抑制",
+                            state = "listening",
+                            message = "持续监听中 · ${currentRecorderRoute(recorder, preferredInputDevice, routeName)}",
+                            isRunning = true,
+                            lastUtteranceMs = lastUtteranceMs,
+                            inputRoute = currentRecorderRoute(recorder, preferredInputDevice, routeName),
+                            outputRoute = routeName,
+                            noiseReductionMode = noiseReductionMode,
+                        ).also { lastDetectionSource = "回放抑制" }
                     continue
                 }
 
                 val startThreshold = max(startThresholdFloor, noiseFloor * startThresholdRatio)
                 val continueThreshold = max(startThresholdFloor * 0.6, noiseFloor * continueThresholdRatio)
-                val isVoiced = rms >= if (capturing) continueThreshold else startThreshold
+                val energyVoiced = rms >= if (capturing) continueThreshold else startThreshold
+                val triggerSource =
+                    when {
+                        vadSpeech -> "VAD"
+                        energyVoiced -> "RMS兜底"
+                        capturing -> "等待结束"
+                        else -> "等待触发"
+                    }
+                val isVoiced =
+                    if (capturing) {
+                        vadSpeech || energyVoiced
+                    } else {
+                        vadSpeech && rms >= max(minNoiseFloor, noiseFloor * 0.95) || energyVoiced
+                    }
 
                 if (!capturing) {
                     noiseFloor = updateNoiseFloor(current = rms, floor = noiseFloor)
                     preRoll.addLast(frame)
                     trimPreRoll(preRoll)
+                    lastRealtimeStatusMs =
+                        publishRealtimeStatusIfNeeded(
+                            nowMs = nowMs,
+                            lastRealtimeStatusMs = lastRealtimeStatusMs,
+                            currentDetectionSource = lastDetectionSource,
+                            nextDetectionSource = triggerSource,
+                            state = "listening",
+                            message = "持续监听中 · ${currentRecorderRoute(recorder, preferredInputDevice, routeName)}",
+                            isRunning = true,
+                            lastUtteranceMs = lastUtteranceMs,
+                            inputRoute = currentRecorderRoute(recorder, preferredInputDevice, routeName),
+                            outputRoute = routeName,
+                            noiseReductionMode = noiseReductionMode,
+                        )
+                    lastDetectionSource = triggerSource
 
                     voicedFrames = if (isVoiced) voicedFrames + 1 else max(0, voicedFrames - 1)
                     if (voicedFrames >= startFramesRequired) {
@@ -209,19 +262,45 @@ class SpeechRepeaterEngine(
                                 lastUtteranceMs,
                                 inputRoute = currentRecorderRoute(recorder, preferredInputDevice, routeName),
                                 outputRoute = routeName,
+                                detectionSource = triggerSource,
+                                noiseReductionMode = noiseReductionMode,
                             ),
                         )
+                        lastDetectionSource = triggerSource
                     }
                     continue
                 }
 
                 captureFrames.add(frame)
                 speechFrames += 1
+                lastRealtimeStatusMs =
+                    publishRealtimeStatusIfNeeded(
+                        nowMs = nowMs,
+                        lastRealtimeStatusMs = lastRealtimeStatusMs,
+                        currentDetectionSource = lastDetectionSource,
+                        nextDetectionSource = triggerSource,
+                        state = "capturing",
+                        message = "检测到讲话，正在录制 · ${currentRecorderRoute(recorder, preferredInputDevice, routeName)}",
+                        isRunning = true,
+                        lastUtteranceMs = lastUtteranceMs,
+                        inputRoute = currentRecorderRoute(recorder, preferredInputDevice, routeName),
+                        outputRoute = routeName,
+                        noiseReductionMode = noiseReductionMode,
+                    )
+                lastDetectionSource = triggerSource
 
-                silentFrames = if (isVoiced) 0 else silentFrames + 1
+                silentFrames =
+                    if (vadSpeech || energyVoiced) {
+                        0
+                    } else {
+                        silentFrames + 1
+                    }
                 if (
                     speechFrames >= maxSpeechFrames ||
-                    (speechFrames >= minSpeechFrames && silentFrames >= endSilenceFrames)
+                    (
+                        speechFrames >= minSpeechFrames &&
+                            silentFrames >= minOf(endSilenceFrames, vadSpeechExitFrames)
+                        )
                 ) {
                     repeat(endPaddingFrames) {
                         captureFrames.add(ByteArray(frameBytes))
@@ -252,11 +331,14 @@ class SpeechRepeaterEngine(
                                 lastUtteranceMs,
                                 inputRoute = currentInputRoute,
                                 outputRoute = routeName,
+                                detectionSource = "回放中",
+                                noiseReductionMode = noiseReductionMode,
                             ),
                         )
                         playOnce(playbackTrack, utterance)
                         suppressionUntilMs = System.currentTimeMillis() + postPlaybackSuppressMs
                         noiseFloor = recoverNoiseFloor(noiseFloor)
+                        lastDetectionSource = "回放抑制"
                     }
 
                     routeName = routeController.currentRouteName()
@@ -270,8 +352,11 @@ class SpeechRepeaterEngine(
                             lastUtteranceMs,
                             inputRoute = currentInputRoute,
                             outputRoute = routeName,
+                            detectionSource = "等待触发",
+                            noiseReductionMode = noiseReductionMode,
                         ),
                     )
+                    lastDetectionSource = "等待触发"
                 }
             }
         } catch (_: InterruptedException) {
@@ -284,6 +369,8 @@ class SpeechRepeaterEngine(
                     lastUtteranceMs,
                     inputRoute = "未知",
                     outputRoute = routeController.currentRouteName(),
+                    detectionSource = lastDetectionSource,
+                    noiseReductionMode = noiseReductionMode,
                 ),
             )
         } finally {
@@ -292,6 +379,8 @@ class SpeechRepeaterEngine(
                 recorder.stop()
             }
             recorder.release()
+            vad.close()
+            rnNoise.close()
             playbackTrack.stop()
             playbackTrack.release()
             routeController.release()
@@ -303,6 +392,8 @@ class SpeechRepeaterEngine(
                     lastUtteranceMs,
                     inputRoute = "未知",
                     outputRoute = "未知",
+                    detectionSource = "等待触发",
+                    noiseReductionMode = noiseReductionMode,
                 ),
             )
         }
@@ -414,7 +505,7 @@ class SpeechRepeaterEngine(
             return frames
         }
 
-        val silenceThreshold = max(startThresholdFloor * 0.45, noiseFloor * 1.1)
+        val silenceThreshold = max(startThresholdFloor * 0.3, noiseFloor * 0.9)
         val result = ArrayList<ByteArray>(frames.size)
         var silentRun = 0
 
@@ -492,6 +583,39 @@ class SpeechRepeaterEngine(
         return if (fallback.contains("蓝牙")) "蓝牙通话麦克风" else "手机麦克风"
     }
 
+    private fun publishRealtimeStatusIfNeeded(
+        nowMs: Long,
+        lastRealtimeStatusMs: Long,
+        currentDetectionSource: String,
+        nextDetectionSource: String,
+        state: String,
+        message: String,
+        isRunning: Boolean,
+        lastUtteranceMs: Int,
+        inputRoute: String,
+        outputRoute: String,
+        noiseReductionMode: String,
+    ): Long {
+        val sourceChanged = currentDetectionSource != nextDetectionSource
+        val intervalElapsed = nowMs - lastRealtimeStatusMs >= realtimeStatusIntervalMs
+        if (!sourceChanged && !intervalElapsed) {
+            return lastRealtimeStatusMs
+        }
+        onStatus(
+            status(
+                state = state,
+                message = message,
+                isRunning = isRunning,
+                lastUtteranceMs = lastUtteranceMs,
+                inputRoute = inputRoute,
+                outputRoute = outputRoute,
+                detectionSource = nextDetectionSource,
+                noiseReductionMode = noiseReductionMode,
+            ),
+        )
+        return nowMs
+    }
+
     private fun status(
         state: String,
         message: String,
@@ -499,6 +623,9 @@ class SpeechRepeaterEngine(
         lastUtteranceMs: Int = 0,
         inputRoute: String = "未知",
         outputRoute: String = "未知",
+        detectionMode: String = "WebRTC VAD + RMS兜底",
+        detectionSource: String = "等待触发",
+        noiseReductionMode: String = "RNNoise未启用",
     ): Map<String, Any> = mapOf(
         "state" to state,
         "message" to message,
@@ -506,5 +633,8 @@ class SpeechRepeaterEngine(
         "lastUtteranceMs" to lastUtteranceMs,
         "inputRoute" to inputRoute,
         "outputRoute" to outputRoute,
+        "detectionMode" to detectionMode,
+        "detectionSource" to detectionSource,
+        "noiseReductionMode" to noiseReductionMode,
     )
 }
