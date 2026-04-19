@@ -30,6 +30,9 @@ class SpeechRepeaterEngine(
     private val maxSpeechFrames = 3000
     private val preRollFrames = 22
     private val endPaddingFrames = 8
+    private val maxLeadingSilenceFrames = 3
+    private val maxTrailingSilenceFrames = 4
+    private val maxInternalSilenceFrames = 12
     private val startThresholdFloor = 520.0
     private val startThresholdRatio = 2.0
     private val continueThresholdRatio = 1.35
@@ -37,6 +40,7 @@ class SpeechRepeaterEngine(
     private val maxNoiseFloor = 3200.0
     private val routeCheckIntervalFrames = 100
     private val postPlaybackSuppressMs = 180L
+    private val playbackKeepAliveIntervalMs = 120L
     private val routeController = AudioRouteController(appContext)
     private val runStateStore = RunStateStore(appContext)
 
@@ -61,6 +65,14 @@ class SpeechRepeaterEngine(
             routeController.waitForBluetoothScoReady()
             routeName = routeController.currentRouteName()
         }
+        recordLoopWithAudioRecord(routeName, preferBluetooth)
+    }
+
+    private fun recordLoopWithAudioRecord(
+        initialRouteName: String,
+        preferBluetooth: Boolean,
+    ) {
+        var routeName = initialRouteName
         val minBuffer = AudioRecord.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
@@ -110,9 +122,11 @@ class SpeechRepeaterEngine(
         var lastUtteranceMs = 0
         var frameCounter = 0
         var lastRouteEnsureMs = 0L
+        var lastKeepAliveWriteMs = 0L
 
         try {
             recorder.startRecording()
+            playbackTrack.play()
             val currentInputRoute = currentRecorderRoute(recorder, preferredInputDevice, routeName)
             onStatus(
                 status(
@@ -153,6 +167,15 @@ class SpeechRepeaterEngine(
                 val nowMs = System.currentTimeMillis()
                 val frame = frameBuffer.copyOf()
                 val rms = calculateRms(frame)
+
+                if (preferBluetooth) {
+                    lastKeepAliveWriteMs =
+                        keepPlaybackActive(
+                            audioTrack = playbackTrack,
+                            nowMs = nowMs,
+                            lastWriteMs = lastKeepAliveWriteMs,
+                        )
+                }
 
                 if (nowMs < suppressionUntilMs) {
                     noiseFloor = recoverNoiseFloor(noiseFloor)
@@ -203,7 +226,12 @@ class SpeechRepeaterEngine(
                     repeat(endPaddingFrames) {
                         captureFrames.add(ByteArray(frameBytes))
                     }
-                    val utterance = flattenFrames(captureFrames)
+                    val compactedFrames =
+                        compactSilenceFrames(
+                            frames = captureFrames,
+                            noiseFloor = noiseFloor,
+                        )
+                    val utterance = flattenFrames(compactedFrames)
                     lastUtteranceMs = utterance.size / 2 * 1000 / sampleRate
                     capturing = false
                     voicedFrames = 0
@@ -280,6 +308,7 @@ class SpeechRepeaterEngine(
         }
     }
 
+
     private fun createPlaybackTrack(): AudioTrack {
         val minBuffer = AudioTrack.getMinBufferSize(
             sampleRate,
@@ -304,9 +333,11 @@ class SpeechRepeaterEngine(
 
     private fun playOnce(audioTrack: AudioTrack, data: ByteArray): Long {
         return try {
-            if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                audioTrack.play()
+            if (audioTrack.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                audioTrack.pause()
             }
+            audioTrack.flush()
+            audioTrack.play()
             audioTrack.write(data, 0, data.size)
             val durationMs = data.size / 2 * 1000L / sampleRate
             Thread.sleep(durationMs + 80L)
@@ -314,6 +345,22 @@ class SpeechRepeaterEngine(
         } finally {
             audioTrack.flush()
         }
+    }
+
+    private fun keepPlaybackActive(
+        audioTrack: AudioTrack,
+        nowMs: Long,
+        lastWriteMs: Long,
+    ): Long {
+        if (nowMs - lastWriteMs < playbackKeepAliveIntervalMs) {
+            return lastWriteMs
+        }
+        val silence = ByteArray(frameBytes)
+        if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            audioTrack.play()
+        }
+        audioTrack.write(silence, 0, silence.size, AudioTrack.WRITE_NON_BLOCKING)
+        return nowMs
     }
 
     private fun calculateRms(frame: ByteArray): Double {
@@ -359,6 +406,44 @@ class SpeechRepeaterEngine(
         return merged
     }
 
+    private fun compactSilenceFrames(
+        frames: List<ByteArray>,
+        noiseFloor: Double,
+    ): List<ByteArray> {
+        if (frames.isEmpty()) {
+            return frames
+        }
+
+        val silenceThreshold = max(startThresholdFloor * 0.45, noiseFloor * 1.1)
+        val result = ArrayList<ByteArray>(frames.size)
+        var silentRun = 0
+
+        frames.forEachIndexed { index, frame ->
+            val isSilent = calculateRms(frame) < silenceThreshold
+            if (!isSilent) {
+                silentRun = 0
+                result.add(frame)
+                return@forEachIndexed
+            }
+
+            silentRun += 1
+            val remaining = frames.size - index - 1
+            val trailingSilent = remaining < maxTrailingSilenceFrames
+            val limit =
+                when {
+                    result.isEmpty() -> maxLeadingSilenceFrames
+                    trailingSilent -> maxTrailingSilenceFrames
+                    else -> maxInternalSilenceFrames
+                }
+
+            if (silentRun <= limit) {
+                result.add(frame)
+            }
+        }
+
+        return result.ifEmpty { frames.takeLast(minOf(frames.size, maxTrailingSilenceFrames)) }
+    }
+
     private fun refreshPreferredDevice(
         recorder: AudioRecord,
         currentPreferred: AudioDeviceInfo?,
@@ -395,6 +480,7 @@ class SpeechRepeaterEngine(
 
     private fun shouldPreferBluetoothInput(): Boolean =
         runStateStore.getInputMode() != RunStateStore.INPUT_MODE_PHONE
+
 
     private fun currentRecorderRoute(
         recorder: AudioRecord,

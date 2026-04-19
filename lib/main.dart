@@ -193,6 +193,18 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
+      if (_inputMode != InputMode.phone) {
+        final bluetoothGranted =
+            await _methodChannel.invokeMethod<bool>(
+              'requestBluetoothPermission',
+            ) ??
+            false;
+        if (!bluetoothGranted) {
+          _showSnackBar('优先蓝牙模式需要蓝牙权限');
+          return;
+        }
+      }
+
       await _methodChannel.invokeMethod('startListening');
       await _refreshNotificationPermissionStatus();
     } on PlatformException catch (error) {

@@ -20,6 +20,7 @@ class MainActivity : FlutterActivity() {
     private val eventChannelName = "bbreplace/status"
     private var microphonePermissionResult: MethodChannel.Result? = null
     private var notificationPermissionResult: MethodChannel.Result? = null
+    private var bluetoothPermissionResult: MethodChannel.Result? = null
     private val runStateStore by lazy { RunStateStore(this) }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -30,6 +31,7 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "requestMicrophonePermission" -> requestMicrophonePermission(result)
                     "requestNotificationPermission" -> requestNotificationPermission(result)
+                    "requestBluetoothPermission" -> requestBluetoothPermission(result)
                     "startListening" -> {
                         SpeechRepeaterService.start(this)
                         result.success(true)
@@ -100,6 +102,21 @@ class MainActivity : FlutterActivity() {
         requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_POST_NOTIFICATIONS)
     }
 
+    private fun requestBluetoothPermission(result: MethodChannel.Result) {
+        if (hasBluetoothPermission()) {
+            result.success(true)
+            return
+        }
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            result.success(true)
+            return
+        }
+
+        bluetoothPermissionResult = result
+        requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), REQUEST_BLUETOOTH_CONNECT)
+    }
+
     private fun hasMicrophonePermission(): Boolean =
         ContextCompat.checkSelfPermission(
             this,
@@ -116,6 +133,16 @@ class MainActivity : FlutterActivity() {
                 this,
                 Manifest.permission.POST_NOTIFICATIONS,
             ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun hasBluetoothPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return true
+        }
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.BLUETOOTH_CONNECT,
+        ) == PackageManager.PERMISSION_GRANTED
     }
 
     override fun onRequestPermissionsResult(
@@ -137,6 +164,13 @@ class MainActivity : FlutterActivity() {
                     grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
                 notificationPermissionResult?.success(granted)
                 notificationPermissionResult = null
+            }
+
+            REQUEST_BLUETOOTH_CONNECT -> {
+                val granted =
+                    grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                bluetoothPermissionResult?.success(granted)
+                bluetoothPermissionResult = null
             }
         }
     }
@@ -177,5 +211,6 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val REQUEST_RECORD_AUDIO = 2001
         private const val REQUEST_POST_NOTIFICATIONS = 2002
+        private const val REQUEST_BLUETOOTH_CONNECT = 2003
     }
 }

@@ -1,19 +1,51 @@
 package com.example.bbreplace
 
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHeadset
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
+import androidx.core.content.ContextCompat
+import android.content.pm.PackageManager
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class AudioRouteController(
     context: Context,
 ) {
+    private val appContext = context.applicationContext
     private val audioManager =
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val bluetoothManager =
+        context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
 
     private var originalMode = AudioManager.MODE_NORMAL
     private var activeOutputRouteName = "手机扬声器"
     private var activated = false
+    private var bluetoothHeadset: BluetoothHeadset? = null
+    private var activeHeadsetDevice: BluetoothDevice? = null
+    private var headsetProfileLatch: CountDownLatch? = null
+    private val headsetProfileListener =
+        object : BluetoothProfile.ServiceListener {
+            override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                if (profile == BluetoothProfile.HEADSET) {
+                    bluetoothHeadset = proxy as? BluetoothHeadset
+                    headsetProfileLatch?.countDown()
+                }
+            }
+
+            override fun onServiceDisconnected(profile: Int) {
+                if (profile == BluetoothProfile.HEADSET) {
+                    bluetoothHeadset = null
+                    activeHeadsetDevice = null
+                }
+            }
+        }
 
     fun activateCommunicationRoute(preferBluetooth: Boolean): String {
         if (!activated) {
@@ -44,6 +76,8 @@ class AudioRouteController(
             @Suppress("DEPRECATION")
             audioManager.isBluetoothScoOn = false
         }
+        stopHeadsetVoiceRecognition()
+        closeHeadsetProfile()
         @Suppress("DEPRECATION")
         audioManager.isSpeakerphoneOn = false
         audioManager.mode = originalMode
@@ -79,6 +113,7 @@ class AudioRouteController(
     }
 
     private fun activateModernRoute(): String {
+        startHeadsetVoiceRecognition()
         val devices = audioManager.availableCommunicationDevices
         preferredCommunicationTypes().forEach { preferredType ->
             val device = devices.firstOrNull { it.type == preferredType }
@@ -94,6 +129,7 @@ class AudioRouteController(
     }
 
     private fun activateLegacyBluetoothSco(): String {
+        startHeadsetVoiceRecognition()
         val hasBluetoothSco =
             audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).any {
                 it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
@@ -193,4 +229,68 @@ class AudioRouteController(
             AudioDeviceInfo.TYPE_USB_HEADSET -> "USB 耳机"
             else -> null
         }
+
+    private fun startHeadsetVoiceRecognition() {
+        if (!hasBluetoothConnectPermission()) {
+            return
+        }
+        val headset = getHeadsetProfile() ?: return
+        val device = headset.connectedDevices.firstOrNull() ?: return
+        activeHeadsetDevice = device
+        try {
+            headset.stopVoiceRecognition(device)
+        } catch (_: Throwable) {
+        }
+        try {
+            headset.startVoiceRecognition(device)
+        } catch (_: SecurityException) {
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun stopHeadsetVoiceRecognition() {
+        if (!hasBluetoothConnectPermission()) {
+            return
+        }
+        val headset = bluetoothHeadset ?: return
+        val device = activeHeadsetDevice ?: headset.connectedDevices.firstOrNull() ?: return
+        try {
+            headset.stopVoiceRecognition(device)
+        } catch (_: SecurityException) {
+        } catch (_: Throwable) {
+        }
+        activeHeadsetDevice = null
+    }
+
+    private fun getHeadsetProfile(): BluetoothHeadset? {
+        bluetoothHeadset?.let { return it }
+        val adapter = bluetoothManager.adapter ?: return null
+        val latch = CountDownLatch(1)
+        headsetProfileLatch = latch
+        val requested = adapter.getProfileProxy(appContext, headsetProfileListener, BluetoothProfile.HEADSET)
+        if (!requested) {
+            headsetProfileLatch = null
+            return null
+        }
+        latch.await(1500L, TimeUnit.MILLISECONDS)
+        headsetProfileLatch = null
+        return bluetoothHeadset
+    }
+
+    private fun closeHeadsetProfile() {
+        val adapter = bluetoothManager.adapter ?: return
+        val headset = bluetoothHeadset ?: return
+        adapter.closeProfileProxy(BluetoothProfile.HEADSET, headset)
+        bluetoothHeadset = null
+    }
+
+    private fun hasBluetoothConnectPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return true
+        }
+        return ContextCompat.checkSelfPermission(
+            appContext,
+            Manifest.permission.BLUETOOTH_CONNECT,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
 }
