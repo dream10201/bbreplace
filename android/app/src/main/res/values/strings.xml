@@ -3,5 +3,6 @@
     <string name="service_channel_name">语音复播</string>
     <string name="service_channel_description">持续监听麦克风并自动回放最近一句话</string>
     <string name="service_notification_title">宝宝复读机正在监听</string>
-    <string name="service_notification_text">检测到一句完整的话后会自动回放一次</string>
+    <string name="service_notification_text">后台持续监听中，检测到完整一句话后会自动回放一次</string>
+    <string name="service_notification_stop_action">停止</string>
 </resources>

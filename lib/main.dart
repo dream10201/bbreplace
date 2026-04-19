@@ -43,6 +43,8 @@ class _HomePageState extends State<HomePage> {
   StatusViewData _status = const StatusViewData.idle();
   bool _busy = false;
   bool _ignoringBatteryOptimizations = false;
+  bool _notificationsEnabled = false;
+  InputMode _inputMode = InputMode.auto;
 
   @override
   void initState() {
@@ -52,6 +54,8 @@ class _HomePageState extends State<HomePage> {
     );
     unawaited(_refreshStatus());
     unawaited(_refreshBatteryOptimizationStatus());
+    unawaited(_refreshNotificationPermissionStatus());
+    unawaited(_refreshInputMode());
   }
 
   @override
@@ -102,6 +106,49 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> _refreshNotificationPermissionStatus() async {
+    try {
+      final result =
+          await _methodChannel.invokeMethod<bool>(
+            'isNotificationPermissionGranted',
+          ) ??
+          false;
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _notificationsEnabled = result;
+      });
+    } on MissingPluginException {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _notificationsEnabled = false;
+      });
+    }
+  }
+
+  Future<void> _refreshInputMode() async {
+    try {
+      final result =
+          await _methodChannel.invokeMethod<String>('getInputMode') ?? 'auto';
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _inputMode = InputMode.fromValue(result);
+      });
+    } on MissingPluginException {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _inputMode = InputMode.auto;
+      });
+    }
+  }
+
   void _onStatusEvent(dynamic event) {
     if (!mounted || event is! Map) {
       return;
@@ -135,7 +182,19 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
+      final notificationsGranted =
+          await _methodChannel.invokeMethod<bool>(
+            'requestNotificationPermission',
+          ) ??
+          false;
+      if (!notificationsGranted) {
+        _showSnackBar('需要通知权限才能稳定后台运行');
+        await _refreshNotificationPermissionStatus();
+        return;
+      }
+
       await _methodChannel.invokeMethod('startListening');
+      await _refreshNotificationPermissionStatus();
     } on PlatformException catch (error) {
       _showSnackBar(error.message ?? '操作失败');
     } finally {
@@ -160,6 +219,34 @@ class _HomePageState extends State<HomePage> {
       await _refreshBatteryOptimizationStatus();
     } on PlatformException catch (error) {
       _showSnackBar(error.message ?? '无法打开电池优化设置');
+    }
+  }
+
+  Future<void> _setInputMode(InputMode mode) async {
+    if (_inputMode == mode) {
+      return;
+    }
+    try {
+      await _methodChannel.invokeMethod('setInputMode', {'mode': mode.value});
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _inputMode = mode;
+      });
+      _showSnackBar('输入模式已切换为${mode.label}');
+    } on PlatformException catch (error) {
+      _showSnackBar(error.message ?? '切换输入模式失败');
+    }
+  }
+
+  Future<void> _openNotificationSettings() async {
+    try {
+      await _methodChannel.invokeMethod('openNotificationSettings');
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      await _refreshNotificationPermissionStatus();
+    } on PlatformException catch (error) {
+      _showSnackBar(error.message ?? '无法打开通知设置');
     }
   }
 
@@ -258,10 +345,36 @@ class _HomePageState extends State<HomePage> {
                         ),
                       ),
                       const SizedBox(height: 16),
+                      _RouteLine(label: '当前输入', value: _status.inputRoute),
+                      _RouteLine(label: '当前输出', value: _status.outputRoute),
+                      const SizedBox(height: 16),
                       const _FeatureLine('带预录缓存，避免吞掉开头音节'),
                       const _FeatureLine('用动态噪声底和连续帧判定开始讲话'),
                       const _FeatureLine('用静音尾段判定结束，减少误截断'),
                       const _FeatureLine('回放期间暂停触发，避免无限复读'),
+                      const SizedBox(height: 12),
+                      Text(
+                        '输入模式',
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      SegmentedButton<InputMode>(
+                        segments: InputMode.values
+                            .map(
+                              (mode) => ButtonSegment<InputMode>(
+                                value: mode,
+                                label: Text(mode.label),
+                              ),
+                            )
+                            .toList(),
+                        selected: {_inputMode},
+                        onSelectionChanged: (selection) {
+                          final mode = selection.first;
+                          unawaited(_setInputMode(mode));
+                        },
+                      ),
                       const SizedBox(height: 12),
                       Container(
                         width: double.infinity,
@@ -292,6 +405,21 @@ class _HomePageState extends State<HomePage> {
                                 _ignoringBatteryOptimizations
                                     ? '重新检查电池优化'
                                     : '关闭电池优化',
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Text(
+                              _notificationsEnabled
+                                  ? '通知权限已开启，前台服务通知可见。'
+                                  : '通知权限未开启，前台服务通知可能不显示。',
+                            ),
+                            const SizedBox(height: 10),
+                            OutlinedButton(
+                              onPressed: _openNotificationSettings,
+                              child: Text(
+                                _notificationsEnabled
+                                    ? '检查通知设置'
+                                    : '开启通知权限',
                               ),
                             ),
                           ],
@@ -355,6 +483,33 @@ class _FeatureLine extends StatelessWidget {
   }
 }
 
+class _RouteLine extends StatelessWidget {
+  const _RouteLine({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: RichText(
+        text: TextSpan(
+          style: theme.textTheme.bodyMedium?.copyWith(color: const Color(0xFF1B4332)),
+          children: [
+            TextSpan(
+              text: '$label：',
+              style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+            TextSpan(text: value),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _Badge extends StatelessWidget {
   const _Badge({required this.label, required this.color, this.textColor});
 
@@ -387,18 +542,24 @@ class StatusViewData {
     required this.message,
     required this.isRunning,
     required this.lastUtteranceMs,
+    required this.inputRoute,
+    required this.outputRoute,
   });
 
   const StatusViewData.idle()
     : state = 'idle',
-      message = '未启动',
-      isRunning = false,
-      lastUtteranceMs = 0;
+        message = '未启动',
+        isRunning = false,
+        lastUtteranceMs = 0,
+        inputRoute = '未知',
+        outputRoute = '未知';
 
   final String state;
   final String message;
   final bool isRunning;
   final int lastUtteranceMs;
+  final String inputRoute;
+  final String outputRoute;
 
   factory StatusViewData.fromMap(Map<dynamic, dynamic> map) {
     return StatusViewData(
@@ -406,6 +567,8 @@ class StatusViewData {
       message: map['message'] as String? ?? '未启动',
       isRunning: map['isRunning'] as bool? ?? false,
       lastUtteranceMs: (map['lastUtteranceMs'] as num?)?.toInt() ?? 0,
+      inputRoute: map['inputRoute'] as String? ?? '未知',
+      outputRoute: map['outputRoute'] as String? ?? '未知',
     );
   }
 
@@ -424,4 +587,22 @@ class StatusViewData {
     'error' => const Color(0xFFF28482),
     _ => const Color(0xFFE9ECEF),
   };
+}
+
+enum InputMode {
+  auto('auto', '自动选择'),
+  bluetooth('bluetooth', '优先蓝牙'),
+  phone('phone', '强制手机');
+
+  const InputMode(this.value, this.label);
+
+  final String value;
+  final String label;
+
+  factory InputMode.fromValue(String value) {
+    return InputMode.values.firstWhere(
+      (mode) => mode.value == value,
+      orElse: () => InputMode.auto,
+    );
+  }
 }

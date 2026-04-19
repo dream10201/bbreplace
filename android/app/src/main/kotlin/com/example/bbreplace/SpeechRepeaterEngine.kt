@@ -15,6 +15,7 @@ class SpeechRepeaterEngine(
     context: Context,
     private val onStatus: (Map<String, Any>) -> Unit,
 ) {
+    private val appContext = context.applicationContext
     @Volatile
     private var running = false
 
@@ -24,18 +25,20 @@ class SpeechRepeaterEngine(
     private val frameSamples = 320
     private val frameBytes = frameSamples * 2
     private val startFramesRequired = 2
-    private val endSilenceFrames = 28
-    private val minSpeechFrames = 6
-    private val maxSpeechFrames = 250
-    private val preRollFrames = 16
+    private val endSilenceFrames = 52
+    private val minSpeechFrames = 8
+    private val maxSpeechFrames = 3000
+    private val preRollFrames = 22
+    private val endPaddingFrames = 8
     private val startThresholdFloor = 520.0
     private val startThresholdRatio = 2.0
     private val continueThresholdRatio = 1.35
     private val minNoiseFloor = 120.0
     private val maxNoiseFloor = 3200.0
-    private val routeCheckIntervalFrames = 20
+    private val routeCheckIntervalFrames = 100
     private val postPlaybackSuppressMs = 180L
-    private val routeController = AudioRouteController(context.applicationContext)
+    private val routeController = AudioRouteController(appContext)
+    private val runStateStore = RunStateStore(appContext)
 
     fun start() {
         if (running) {
@@ -52,7 +55,12 @@ class SpeechRepeaterEngine(
     }
 
     private fun recordLoop() {
-        var routeName = routeController.activateCommunicationRoute()
+        val preferBluetooth = shouldPreferBluetoothInput()
+        var routeName = routeController.activateCommunicationRoute(preferBluetooth)
+        if (preferBluetooth) {
+            routeController.waitForBluetoothScoReady()
+            routeName = routeController.currentRouteName()
+        }
         val minBuffer = AudioRecord.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
@@ -84,7 +92,7 @@ class SpeechRepeaterEngine(
             return
         }
 
-        var preferredInputDevice = routeController.findPreferredInputDevice()
+        var preferredInputDevice = selectInputDevice()
         if (preferredInputDevice != null) {
             recorder.preferredDevice = preferredInputDevice
         }
@@ -92,6 +100,7 @@ class SpeechRepeaterEngine(
         val frameBuffer = ByteArray(frameBytes)
         val preRoll = ArrayDeque<ByteArray>()
         val captureFrames = ArrayList<ByteArray>()
+        val playbackTrack = createPlaybackTrack()
         var noiseFloor = 280.0
         var voicedFrames = 0
         var silentFrames = 0
@@ -100,17 +109,40 @@ class SpeechRepeaterEngine(
         var suppressionUntilMs = 0L
         var lastUtteranceMs = 0
         var frameCounter = 0
+        var lastRouteEnsureMs = 0L
 
         try {
             recorder.startRecording()
-            onStatus(status("listening", "持续监听中 · $routeName", true, lastUtteranceMs))
+            val currentInputRoute = currentRecorderRoute(recorder, preferredInputDevice, routeName)
+            onStatus(
+                status(
+                    "listening",
+                    "持续监听中 · $currentInputRoute",
+                    true,
+                    lastUtteranceMs,
+                    inputRoute = currentInputRoute,
+                    outputRoute = routeName,
+                ),
+            )
 
             while (running && !Thread.currentThread().isInterrupted) {
                 frameCounter += 1
                 if (frameCounter >= routeCheckIntervalFrames) {
                     frameCounter = 0
-                    routeName = routeController.ensureCommunicationRoute()
-                    preferredInputDevice = refreshPreferredDevice(recorder, preferredInputDevice)
+                    val nowRouteMs = System.currentTimeMillis()
+                    val currentRoute = currentRecorderRoute(recorder, preferredInputDevice, routeName)
+                    val needsBluetoothRecovery =
+                        preferBluetooth && !currentRoute.contains("蓝牙")
+                    if (needsBluetoothRecovery && nowRouteMs - lastRouteEnsureMs >= 2_000L) {
+                        lastRouteEnsureMs = nowRouteMs
+                        routeName = routeController.ensureCommunicationRoute(preferBluetooth)
+                        if (preferBluetooth) {
+                            routeController.waitForBluetoothScoReady(1200L)
+                        }
+                        preferredInputDevice = refreshPreferredDevice(recorder, preferredInputDevice)
+                    } else if (!needsBluetoothRecovery) {
+                        preferredInputDevice = refreshPreferredDevice(recorder, preferredInputDevice)
+                    }
                 }
 
                 val read = recorder.read(frameBuffer, 0, frameBuffer.size)
@@ -152,6 +184,8 @@ class SpeechRepeaterEngine(
                                 "检测到讲话，正在录制 · ${currentRecorderRoute(recorder, preferredInputDevice, routeName)}",
                                 true,
                                 lastUtteranceMs,
+                                inputRoute = currentRecorderRoute(recorder, preferredInputDevice, routeName),
+                                outputRoute = routeName,
                             ),
                         )
                     }
@@ -166,6 +200,9 @@ class SpeechRepeaterEngine(
                     speechFrames >= maxSpeechFrames ||
                     (speechFrames >= minSpeechFrames && silentFrames >= endSilenceFrames)
                 ) {
+                    repeat(endPaddingFrames) {
+                        captureFrames.add(ByteArray(frameBytes))
+                    }
                     val utterance = flattenFrames(captureFrames)
                     lastUtteranceMs = utterance.size / 2 * 1000 / sampleRate
                     capturing = false
@@ -176,40 +213,80 @@ class SpeechRepeaterEngine(
                     preRoll.clear()
 
                     if (utterance.isNotEmpty()) {
-                        routeName = routeController.ensureCommunicationRoute()
+                        routeName = routeController.currentRouteName()
                         preferredInputDevice = refreshPreferredDevice(recorder, preferredInputDevice)
-                        onStatus(status("playing", "回放刚才的声音 · $routeName", true, lastUtteranceMs))
-                        playOnce(utterance)
+                        val currentInputRoute = currentRecorderRoute(recorder, preferredInputDevice, routeName)
+                        onStatus(
+                            status(
+                                "playing",
+                                "回放刚才的声音 · $routeName",
+                                true,
+                                lastUtteranceMs,
+                                inputRoute = currentInputRoute,
+                                outputRoute = routeName,
+                            ),
+                        )
+                        playOnce(playbackTrack, utterance)
                         suppressionUntilMs = System.currentTimeMillis() + postPlaybackSuppressMs
                         noiseFloor = recoverNoiseFloor(noiseFloor)
                     }
 
-                    routeName = routeController.ensureCommunicationRoute()
+                    routeName = routeController.currentRouteName()
                     preferredInputDevice = refreshPreferredDevice(recorder, preferredInputDevice)
-                    onStatus(status("listening", "持续监听中 · $routeName", true, lastUtteranceMs))
+                    val currentInputRoute = currentRecorderRoute(recorder, preferredInputDevice, routeName)
+                    onStatus(
+                        status(
+                            "listening",
+                            "持续监听中 · $currentInputRoute",
+                            true,
+                            lastUtteranceMs,
+                            inputRoute = currentInputRoute,
+                            outputRoute = routeName,
+                        ),
+                    )
                 }
             }
         } catch (_: InterruptedException) {
         } catch (error: Throwable) {
-            onStatus(status("error", error.message ?: "监听异常中断", false, lastUtteranceMs))
+            onStatus(
+                status(
+                    "error",
+                    error.message ?: "监听异常中断",
+                    false,
+                    lastUtteranceMs,
+                    inputRoute = "未知",
+                    outputRoute = routeController.currentRouteName(),
+                ),
+            )
         } finally {
             running = false
             if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
                 recorder.stop()
             }
             recorder.release()
+            playbackTrack.stop()
+            playbackTrack.release()
             routeController.release()
-            onStatus(status("idle", "已停止", false, lastUtteranceMs))
+            onStatus(
+                status(
+                    "idle",
+                    "已停止",
+                    false,
+                    lastUtteranceMs,
+                    inputRoute = "未知",
+                    outputRoute = "未知",
+                ),
+            )
         }
     }
 
-    private fun playOnce(data: ByteArray): Long {
+    private fun createPlaybackTrack(): AudioTrack {
         val minBuffer = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
         )
-        val audioTrack = AudioTrack(
+        return AudioTrack(
             AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
@@ -219,20 +296,23 @@ class SpeechRepeaterEngine(
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                 .build(),
-            max(minBuffer, data.size),
-            AudioTrack.MODE_STATIC,
+            max(minBuffer, frameBytes * 16),
+            AudioTrack.MODE_STREAM,
             AudioManager.AUDIO_SESSION_ID_GENERATE,
         )
+    }
 
+    private fun playOnce(audioTrack: AudioTrack, data: ByteArray): Long {
         return try {
+            if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                audioTrack.play()
+            }
             audioTrack.write(data, 0, data.size)
-            audioTrack.play()
             val durationMs = data.size / 2 * 1000L / sampleRate
             Thread.sleep(durationMs + 80L)
             durationMs
         } finally {
-            audioTrack.stop()
-            audioTrack.release()
+            audioTrack.flush()
         }
     }
 
@@ -284,22 +364,46 @@ class SpeechRepeaterEngine(
         currentPreferred: AudioDeviceInfo?,
     ): AudioDeviceInfo? {
         val routedDevice = recorder.routedDevice
-        val bestDevice = routeController.findPreferredInputDevice()
-        if (bestDevice != null && (currentPreferred?.id != bestDevice.id || routedDevice?.id != bestDevice.id)) {
+        val bestDevice = selectInputDevice()
+        if (
+            bestDevice != null &&
+            currentPreferred?.id != bestDevice.id &&
+            routedDevice?.id != bestDevice.id
+        ) {
             recorder.preferredDevice = bestDevice
             return bestDevice
         }
         return currentPreferred ?: bestDevice
     }
 
+    private fun selectInputDevice(): AudioDeviceInfo? =
+        when (runStateStore.getInputMode()) {
+            RunStateStore.INPUT_MODE_BLUETOOTH ->
+                routeController.findBluetoothInputDevice()
+                    ?: routeController.findBuiltinInputDevice()
+                    ?: routeController.findPreferredInputDevice()
+
+            RunStateStore.INPUT_MODE_PHONE ->
+                routeController.findBuiltinInputDevice()
+                    ?: routeController.findPreferredInputDevice()
+
+            else ->
+                routeController.findBluetoothInputDevice()
+                    ?: routeController.findBuiltinInputDevice()
+                    ?: routeController.findPreferredInputDevice()
+        }
+
+    private fun shouldPreferBluetoothInput(): Boolean =
+        runStateStore.getInputMode() != RunStateStore.INPUT_MODE_PHONE
+
     private fun currentRecorderRoute(
         recorder: AudioRecord,
         preferredDevice: AudioDeviceInfo?,
         fallback: String,
     ): String {
-        recorder.routedDevice?.let { return routeController.routeLabel(it) }
-        preferredDevice?.let { return routeController.routeLabel(it) }
-        return fallback
+        recorder.routedDevice?.let { return routeController.inputRouteLabel(it) }
+        preferredDevice?.let { return routeController.inputRouteLabel(it) }
+        return if (fallback.contains("蓝牙")) "蓝牙通话麦克风" else "手机麦克风"
     }
 
     private fun status(
@@ -307,10 +411,14 @@ class SpeechRepeaterEngine(
         message: String,
         isRunning: Boolean,
         lastUtteranceMs: Int = 0,
+        inputRoute: String = "未知",
+        outputRoute: String = "未知",
     ): Map<String, Any> = mapOf(
         "state" to state,
         "message" to message,
         "isRunning" to isRunning,
         "lastUtteranceMs" to lastUtteranceMs,
+        "inputRoute" to inputRoute,
+        "outputRoute" to outputRoute,
     )
 }

@@ -13,6 +13,8 @@ object StatusReporter {
         "message" to "未启动",
         "isRunning" to false,
         "lastUtteranceMs" to 0,
+        "inputRoute" to "未知",
+        "outputRoute" to "未知",
     )
 
     @Volatile

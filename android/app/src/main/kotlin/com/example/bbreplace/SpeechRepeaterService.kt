@@ -83,8 +83,47 @@ class SpeechRepeaterService : Service() {
             .setContentTitle(getString(R.string.service_notification_title))
             .setContentText(getString(R.string.service_notification_text))
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentIntent(createLaunchPendingIntent())
+            .addAction(
+                android.R.drawable.ic_media_pause,
+                getString(R.string.service_notification_stop_action),
+                createStopPendingIntent(),
+            )
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
             .setOngoing(true)
             .build()
+
+    private fun createLaunchPendingIntent(): PendingIntent {
+        val launchIntent =
+            packageManager.getLaunchIntentForPackage(packageName)
+                ?.apply {
+                    addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+                ?: Intent(this, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+        return PendingIntent.getActivity(
+            this,
+            OPEN_APP_REQUEST_CODE,
+            launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    private fun createStopPendingIntent(): PendingIntent {
+        val stopIntent =
+            Intent(this, SpeechRepeaterService::class.java).apply {
+                action = ACTION_STOP
+            }
+        return PendingIntent.getService(
+            this,
+            STOP_REQUEST_CODE,
+            stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
 
     private fun scheduleRestart() {
         val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
@@ -111,7 +150,9 @@ class SpeechRepeaterService : Service() {
     companion object {
         private const val CHANNEL_ID = "speech_repeater_channel"
         private const val NOTIFICATION_ID = 1001
+        private const val OPEN_APP_REQUEST_CODE = 2001
         private const val RESTART_REQUEST_CODE = 2002
+        private const val STOP_REQUEST_CODE = 2003
         private const val RESTART_DELAY_MS = 1500L
         const val ACTION_START = "com.example.bbreplace.action.START"
         const val ACTION_STOP = "com.example.bbreplace.action.STOP"

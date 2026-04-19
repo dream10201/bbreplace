@@ -12,10 +12,10 @@ class AudioRouteController(
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     private var originalMode = AudioManager.MODE_NORMAL
-    private var activeRouteName = "手机麦克风"
+    private var activeOutputRouteName = "手机扬声器"
     private var activated = false
 
-    fun activateCommunicationRoute(): String {
+    fun activateCommunicationRoute(preferBluetooth: Boolean): String {
         if (!activated) {
             originalMode = audioManager.mode
             activated = true
@@ -24,13 +24,15 @@ class AudioRouteController(
         @Suppress("DEPRECATION")
         audioManager.isSpeakerphoneOn = false
 
-        activeRouteName =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        activeOutputRouteName =
+            if (preferBluetooth && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 activateModernRoute()
-            } else {
+            } else if (preferBluetooth) {
                 activateLegacyBluetoothSco()
+            } else {
+                "手机扬声器"
             }
-        return activeRouteName
+        return activeOutputRouteName
     }
 
     fun release() {
@@ -48,29 +50,47 @@ class AudioRouteController(
         activated = false
     }
 
-    fun currentRouteName(): String = activeRouteName
+    fun currentRouteName(): String = activeOutputRouteName
 
-    fun ensureCommunicationRoute(): String = activateCommunicationRoute()
+    fun ensureCommunicationRoute(preferBluetooth: Boolean): String =
+        activateCommunicationRoute(preferBluetooth)
 
     fun findPreferredInputDevice(): AudioDeviceInfo? {
         val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
 
-        preferredTypes().forEach { preferredType ->
+        preferredInputTypes().forEach { preferredType ->
             inputDevices.firstOrNull { it.type == preferredType }?.let { return it }
         }
 
         return inputDevices.firstOrNull()
     }
 
+    fun findBluetoothInputDevice(): AudioDeviceInfo? {
+        val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+        bluetoothInputTypes().forEach { preferredType ->
+            inputDevices.firstOrNull { it.type == preferredType }?.let { return it }
+        }
+        return null
+    }
+
+    fun findBuiltinInputDevice(): AudioDeviceInfo? {
+        val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+        return inputDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+    }
+
     private fun activateModernRoute(): String {
         val devices = audioManager.availableCommunicationDevices
-        preferredTypes().forEach { preferredType ->
+        preferredCommunicationTypes().forEach { preferredType ->
             val device = devices.firstOrNull { it.type == preferredType }
             if (device != null && audioManager.setCommunicationDevice(device)) {
-                return displayName(device)
+                @Suppress("DEPRECATION")
+                audioManager.startBluetoothSco()
+                @Suppress("DEPRECATION")
+                audioManager.isBluetoothScoOn = true
+                return outputDisplayName(device)
             }
         }
-        return "手机麦克风"
+        return "手机扬声器"
     }
 
     private fun activateLegacyBluetoothSco(): String {
@@ -86,38 +106,91 @@ class AudioRouteController(
         audioManager.startBluetoothSco()
         @Suppress("DEPRECATION")
         audioManager.isBluetoothScoOn = true
-        return "蓝牙通话麦克风"
+        return "蓝牙通话耳机/音箱"
     }
 
-    fun routeLabel(device: AudioDeviceInfo?): String {
-        if (device == null) {
-            return activeRouteName
+    fun waitForBluetoothScoReady(timeoutMs: Long = 1800L): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val hasBluetoothInput = findBluetoothInputDevice() != null
+            val communicationDevice =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    audioManager.communicationDevice
+                } else {
+                    null
+                }
+            val communicationOnBluetooth =
+                communicationDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        communicationDevice?.type == AudioDeviceInfo.TYPE_BLE_HEADSET)
+            @Suppress("DEPRECATION")
+            val scoOn = audioManager.isBluetoothScoOn
+            if (hasBluetoothInput && (communicationOnBluetooth || scoOn)) {
+                return true
+            }
+            Thread.sleep(60L)
         }
-        return displayName(device)
+        return findBluetoothInputDevice() != null
     }
 
-    private fun preferredTypes(): List<Int> {
+    fun inputRouteLabel(device: AudioDeviceInfo?): String {
+        if (device == null) {
+            return "未知"
+        }
+        return inputDisplayName(device)
+    }
+
+    private fun preferredCommunicationTypes(): List<Int> {
         val types = mutableListOf<Int>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             types += AudioDeviceInfo.TYPE_BLE_HEADSET
         }
         types += AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            types += AudioDeviceInfo.TYPE_BLE_SPEAKER
-        }
         types += AudioDeviceInfo.TYPE_WIRED_HEADSET
         types += AudioDeviceInfo.TYPE_USB_HEADSET
         return types
     }
 
-    private fun displayName(device: AudioDeviceInfo): String =
-        device.productName?.toString()?.takeIf { it.isNotBlank() } ?: typeLabel(device.type)
+    private fun preferredInputTypes(): List<Int> = preferredCommunicationTypes()
 
-    private fun typeLabel(type: Int): String =
+    private fun bluetoothInputTypes(): List<Int> {
+        val types = mutableListOf<Int>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            types += AudioDeviceInfo.TYPE_BLE_HEADSET
+        }
+        types += AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        return types
+    }
+
+    private fun inputDisplayName(device: AudioDeviceInfo): String =
+        inputTypeLabel(device.type)
+            ?: device.productName?.toString()?.takeIf { it.isNotBlank() }
+            ?: "外接麦克风"
+
+    private fun outputDisplayName(device: AudioDeviceInfo): String =
+        outputTypeLabel(device.type)
+            ?: device.productName?.toString()?.takeIf { it.isNotBlank() }
+            ?: "外接扬声器"
+
+    private fun inputTypeLabel(type: Int): String? =
         when (type) {
+            AudioDeviceInfo.TYPE_BUILTIN_MIC -> "手机麦克风"
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "蓝牙通话麦克风"
+            AudioDeviceInfo.TYPE_BLE_HEADSET -> "蓝牙耳机麦克风"
             AudioDeviceInfo.TYPE_WIRED_HEADSET -> "有线耳机麦克风"
             AudioDeviceInfo.TYPE_USB_HEADSET -> "USB 耳机麦克风"
-            else -> "外接麦克风"
+            else -> null
+        }
+
+    private fun outputTypeLabel(type: Int): String? =
+        when (type) {
+            AudioDeviceInfo.TYPE_BUILTIN_MIC,
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "手机扬声器"
+            AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "手机听筒"
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "蓝牙通话耳机/音箱"
+            AudioDeviceInfo.TYPE_BLE_HEADSET -> "蓝牙耳机"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET -> "有线耳机"
+            AudioDeviceInfo.TYPE_USB_HEADSET -> "USB 耳机"
+            else -> null
         }
 }
