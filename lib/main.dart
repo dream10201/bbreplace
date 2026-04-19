@@ -42,6 +42,7 @@ class _HomePageState extends State<HomePage> {
   StreamSubscription<dynamic>? _statusSubscription;
   StatusViewData _status = const StatusViewData.idle();
   bool _busy = false;
+  bool _ignoringBatteryOptimizations = false;
 
   @override
   void initState() {
@@ -50,6 +51,7 @@ class _HomePageState extends State<HomePage> {
       _onStatusEvent,
     );
     unawaited(_refreshStatus());
+    unawaited(_refreshBatteryOptimizationStatus());
   }
 
   @override
@@ -73,6 +75,29 @@ class _HomePageState extends State<HomePage> {
       }
       setState(() {
         _status = const StatusViewData.idle();
+      });
+    }
+  }
+
+  Future<void> _refreshBatteryOptimizationStatus() async {
+    try {
+      final result =
+          await _methodChannel.invokeMethod<bool>(
+            'isIgnoringBatteryOptimizations',
+          ) ??
+          false;
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _ignoringBatteryOptimizations = result;
+      });
+    } on MissingPluginException {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _ignoringBatteryOptimizations = false;
       });
     }
   }
@@ -126,6 +151,16 @@ class _HomePageState extends State<HomePage> {
     ScaffoldMessenger.of(context)
       ..clearSnackBars()
       ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _openBatteryOptimizationSettings() async {
+    try {
+      await _methodChannel.invokeMethod('requestIgnoreBatteryOptimizations');
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      await _refreshBatteryOptimizationStatus();
+    } on PlatformException catch (error) {
+      _showSnackBar(error.message ?? '无法打开电池优化设置');
+    }
   }
 
   @override
@@ -227,6 +262,41 @@ class _HomePageState extends State<HomePage> {
                       const _FeatureLine('用动态噪声底和连续帧判定开始讲话'),
                       const _FeatureLine('用静音尾段判定结束，减少误截断'),
                       const _FeatureLine('回放期间暂停触发，避免无限复读'),
+                      const SizedBox(height: 12),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFF0F7F2),
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '后台保活',
+                              style: theme.textTheme.titleSmall?.copyWith(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              _ignoringBatteryOptimizations
+                                  ? '已加入电池优化白名单，后台更稳。'
+                                  : '建议关闭电池优化，减少后台被系统杀掉。',
+                            ),
+                            const SizedBox(height: 10),
+                            OutlinedButton(
+                              onPressed: _openBatteryOptimizationSettings,
+                              child: Text(
+                                _ignoringBatteryOptimizations
+                                    ? '重新检查电池优化'
+                                    : '关闭电池优化',
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
                       const Spacer(),
                       SizedBox(
                         width: double.infinity,

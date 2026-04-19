@@ -1,7 +1,13 @@
 package com.example.bbreplace
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -28,6 +34,15 @@ class MainActivity : FlutterActivity() {
                     "stopListening" -> {
                         SpeechRepeaterService.stop(this)
                         result.success(true)
+                    }
+
+                    "requestIgnoreBatteryOptimizations" -> {
+                        requestIgnoreBatteryOptimizations()
+                        result.success(true)
+                    }
+
+                    "isIgnoringBatteryOptimizations" -> {
+                        result.success(isIgnoringBatteryOptimizations())
                     }
 
                     "getStatus" -> result.success(StatusReporter.snapshot())
@@ -67,6 +82,25 @@ class MainActivity : FlutterActivity() {
         val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
         permissionResult?.success(granted)
         permissionResult = null
+    }
+
+    private fun requestIgnoreBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || isIgnoringBatteryOptimizations()) {
+            return
+        }
+        val intent =
+            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+        startActivity(intent)
+    }
+
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return true
+        }
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        return powerManager.isIgnoringBatteryOptimizations(packageName)
     }
 
     companion object {
